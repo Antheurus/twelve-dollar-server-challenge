@@ -98,6 +98,8 @@ excluding the dial) over raw TCP from four client containers, scored by the same
 | 55,000 | 90 s | — | 0 | 1.0 ms | 28 ms | 40 % | pass |
 | 80,000 | 90 s | — | 0 | 1.4 ms | 229 ms | 57 % | pass |
 | 120,000 | 120 s | 1,517,603 | 0 | 5.4 ms | 223 ms | 68 % | pass |
+| 120,000 | 300 s | 3,805,601 | 0 | 1.0 ms | 14 ms | 64 % | pass |
+| 120,000 | 300 s | 3,806,572 | 0 | 0.87 ms | 3.6 ms | 67 % | pass |
 | 122,500 | 120 s | | | | | 101 % | fail |
 | 125,000 | 120 s | | | | | 93 % | fail |
 
@@ -106,8 +108,9 @@ The same 80k load held for five minutes (two processes, plain hashing, before st
 (2 min holds): 80k pass, 160k fail, 120k pass, 140k fail, 130k fail, 125k fail, 122.5k fail. The
 160k, 140k and 130k runs used the earlier hashed layout, which costs more CPU than this one; the
 rest are this build. Memory peaks under 720 MiB for the whole container (page cache of the
-database included); the Go heap is 14–44 MiB and the GC does not run under load. All 120,004
-connections stayed open through the hold (0 reconnects).
+database included); the Go heap is 14–44 MiB and the GC does not run under load. 120k was then confirmed
+the way the scoring confirms a score, with a five-minute hold, twice in a row on this exact build;
+all 120,004 connections stayed open through every hold (0 reconnects).
 
 A droplet vCPU is slower than an M2 core, so expect lower numbers there. At the limit about three
 quarters of the server's CPU is the kernel's TCP work (in this setup it also carries part of the
