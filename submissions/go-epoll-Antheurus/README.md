@@ -112,7 +112,25 @@ database included); the Go heap is 14–44 MiB and the GC does not run under loa
 the way the scoring confirms a score, with a five-minute hold, twice in a row on this exact build;
 all 120,004 connections stayed open through every hold (0 reconnects).
 
-A droplet vCPU is slower than an M2 core, so expect lower numbers there. At the limit about three
+### On x86
+
+The same commit on a 6-vCPU AMD EPYC VPS (Ubuntu 24.04, kernel 6.8), the server container again
+held to one CPU and 2 GB, the four load clients on the same machine:
+
+| Users | Hold | Failed | p95 | p99 | Server CPU | Result |
+|---:|---:|---:|---:|---:|---:|---|
+| 40,000 | 120 s | 0 | 4.3 ms | 176 ms | 66 % | pass |
+| 50,000 | 120 s | 0 | 33 ms | 199 ms | 79 % | pass |
+| 55,000 | 300 s | 0 of 1.74M | 22 ms | 168 ms | 78 % | pass |
+| 57,500 | 300 s | 0 | 374 ms | 1.13 s | 90 % | fail |
+| 60,000 | 120 s | 0 | 2.0 s | 3.6 s | 94 % | fail |
+
+So about 55k there, roughly half of the M2 figure: each request costs about twice the CPU. That
+box is a pessimistic stand-in for the droplet: it was also running other services, and with the
+load clients on the same kernel part of their receive work lands on the server's CPU, which k6 on
+a separate machine does not do.
+
+A droplet vCPU is slower than an M2 core, so expect lower numbers there than the table above. At the limit about three
 quarters of the server's CPU is the kernel's TCP work (in this setup it also carries part of the
 clients' receive path), so the user-space cost is no longer what decides it.
 
@@ -142,3 +160,5 @@ What the process layout costs, same load, interleaved runs:
 | Committing at most every 10 / 25 ms (fewer page-cache resets in the other processes) | CPU within noise (54 → 50/51 %), p95 0.8 → 6/16 ms |
 | SQLite `-O3`, `SQLITE_THREADSAFE=0` | `/feed` 12.4–13.5 µs vs 12.5–12.9 µs: noise |
 | gzip | k6 creates its transport with `DisableCompression: true` and sends no `Accept-Encoding` |
+| Handing over at ~61k instead of ~56.5k (one process up to 61k) | On x86 at 60k: 94 → 83–85 % CPU, but at 120k on the M2 p95 went 29–419 ms → 575–796 ms in two A/B runs |
+| Coalescing wakeups (a 200 µs pause before `epoll_wait` when a pass found few events) | Same CPU as without it in an A/B on x86; and where the timer is coarse the pause becomes 1 ms (measured in Docker on macOS) and caps the loop: 120k collapsed |
