@@ -24,7 +24,7 @@ SQLITE_PATH=... JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 
 **One event loop per process, everything on it.** Each process is one OS thread running
 level-triggered `epoll`: accept, read, parse, query SQLite, write. On one vCPU there is nothing to
-gain from more threads, and a connection costs a ~60-byte struct in a table indexed by fd, not a
+gain from more threads, and a connection costs a small struct in a table indexed by fd, not a
 goroutine and its buffers. Reads, writes, accepts and closes on the non-blocking sockets use raw
 syscalls, skipping the scheduler hand-off of a blocking syscall. The steady state allocates
 nothing, so the Go GC never runs during a load test (verified with `GODEBUG=gctrace=1`).
@@ -103,8 +103,9 @@ excluding the dial) over raw TCP from four client containers, scored by the same
 
 The same 80k load held for five minutes (two processes, plain hashing, before steering) served
 2,536,475 requests with 0 failed, p95 1.08 ms, p99 21 ms, 55 % CPU. Binary search as in the scoring
-(2 min holds): 80k pass, 160k fail, 120k pass, 140k fail, 130k fail,
-125k fail, 122.5k fail. Memory peaks under 720 MiB for the whole container (page cache of the
+(2 min holds): 80k pass, 160k fail, 120k pass, 140k fail, 130k fail, 125k fail, 122.5k fail. The
+160k, 140k and 130k runs used the earlier hashed layout, which costs more CPU than this one; the
+rest are this build. Memory peaks under 720 MiB for the whole container (page cache of the
 database included); the Go heap is 14–44 MiB and the GC does not run under load. All 120,004
 connections stayed open through the hold (0 reconnects).
 
