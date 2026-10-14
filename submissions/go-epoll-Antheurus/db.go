@@ -23,8 +23,8 @@ const (
        (SELECT count(*) FROM likes l WHERE l.post_id = p.id)
   FROM posts p JOIN users u ON u.id = p.user_id
  ORDER BY p.created_at DESC, p.id DESC LIMIT 20`
-	// Same columns as sqlFeed. For one row the JOIN form measured 7.0 us against 1.5 us for
-	// scalar subqueries (a fixed per-execution cost); for twenty rows the JOIN wins, 11.0 against 12.6.
+	// Same columns as sqlFeed, but scalar subqueries: for a single row the JOIN carries a fixed
+	// per-execution cost that the subqueries do not, while for twenty rows the JOIN is cheaper.
 	sqlPost = `SELECT p.id, p.body, p.created_at,
        (SELECT username FROM users WHERE id = p.user_id),
        (SELECT count(*) FROM likes WHERE post_id = p.id)

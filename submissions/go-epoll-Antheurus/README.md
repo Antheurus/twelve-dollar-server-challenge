@@ -29,15 +29,23 @@ goroutine and its buffers. Reads, writes, accepts and closes on the non-blocking
 syscalls, skipping the scheduler hand-off of a blocking syscall. The steady state allocates
 nothing, so the Go GC never runs during a load test (verified with `GODEBUG=gctrace=1`).
 
-**Three processes sharing port 80 (`SO_REUSEPORT`), for file descriptors, not CPU.** The service
-gets `LimitNOFILE=65535`, which is per process. One process tops out near 59k open sockets, so
-past that it would have to close idle keep-alive connections and k6 would reconnect on its next
-request: more CPU per request, and on a box with connection tracking a full conntrack table
-dropping SYNs. Three processes hold ~178k connections, so every k6 user keeps its connection for
-the whole run. The first process supervises the other two (restarts them if they exit, takes them
-down with it). If the fd table ever does run short, a process closes only connections idle for
-more than 2 s, shorter than the 3 s minimum think time in `bench/load.js` and well past any
-request in flight.
+**Up to three processes on port 80, filled one at a time, for file descriptors, not CPU.** The
+service gets `LimitNOFILE=65535`, which is per process, so one process tops out near 59k open
+sockets; past that it would have to close idle keep-alive connections and k6 would reconnect
+(more CPU per request, and on a box with connection tracking a full conntrack table drops SYNs).
+More processes hold more sockets, but every process that serves traffic costs CPU of its own:
+more wakeups and smaller batches per wakeup (measurements below). So the three processes all bind
+the port with `SO_REUSEPORT`, and the first attaches a one-instruction classic BPF program to the
+group (`SO_ATTACH_REUSEPORT_CBPF`, no privileges needed) that returns the index of the process
+that is currently filling. When a process reaches ~56.5k sockets (checked on every accept) the
+program is re-pointed at the next one. Below ~56k users one process serves everything; at 80k
+two do; the third only takes connections past ~113k. Listeners are never closed, so nothing
+waiting in an accept queue is lost. `socket(7)` defines the indices (`listen()` order) and the
+fallback (an out-of-range index means plain hashing); if a process dies, the first one detaches
+the program, falls back to hashing over the survivors, and restarts it. The first process
+supervises the others, which die with it (`Pdeathsig`). If the fd table still runs short, a
+process closes only connections idle for more than 2 s, shorter than the 3 s minimum think time
+in `bench/load.js` and well past any request in flight.
 
 **SQLite: one connection per process, statements prepared once, one cgo call per query.** The C
 shim binds, steps every row, packs the columns into a buffer and resets, so `/feed` (20 rows, 100
@@ -78,13 +86,52 @@ to 500 code points, the same unit as the schema's `length(body)` check.
 
 ## Measured
 
-RESULTS_PLACEHOLDER
+Local, not the droplet: a Docker container capped at one CPU (`--cpu-period=10000 --cpu-quota=10000`)
+and 2 GB on an Apple M2 Pro, `LimitNOFILE=65535`, a fresh seed copy every run, served directly.
+k6 needs ~280 KB per user, too much to put 120k users on one machine, so `loadgen/` replays
+`bench/load.js` (same loop, think times, mix, one keep-alive connection per user, latency
+excluding the dial) over raw TCP from four client containers, scored by the same rule: p95 <
+500 ms, p99 < 1 s, < 1% failed. Server CPU is the container's cgroup usage over the hold.
+
+| Users | Hold | Requests | Failed | p95 | p99 | Server CPU | Result |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 55,000 | 90 s | — | 0 | 1.0 ms | 28 ms | 40 % | pass |
+| 80,000 | 90 s | — | 0 | 1.4 ms | 229 ms | 57 % | pass |
+| 120,000 | 120 s | 1,517,603 | 0 | 5.4 ms | 223 ms | 68 % | pass |
+| 122,500 | 120 s | | | | | 101 % | fail |
+| 125,000 | 120 s | | | | | 93 % | fail |
+
+The same 80k load held for five minutes (two processes, plain hashing, before steering) served
+2,536,475 requests with 0 failed, p95 1.08 ms, p99 21 ms, 55 % CPU. Binary search as in the scoring
+(2 min holds): 80k pass, 160k fail, 120k pass, 140k fail, 130k fail,
+125k fail, 122.5k fail. Memory peaks under 720 MiB for the whole container (page cache of the
+database included); the Go heap is 14–44 MiB and the GC does not run under load. All 120,004
+connections stayed open through the hold (0 reconnects).
+
+A droplet vCPU is slower than an M2 core, so expect lower numbers there. At the limit about three
+quarters of the server's CPU is the kernel's TCP work (in this setup it also carries part of the
+clients' receive path), so the user-space cost is no longer what decides it.
+
+What the process layout costs, same load, interleaved runs:
+
+| Users | Layout | Server CPU |
+|---:|---|---:|
+| 55,000 | one process | 37–38 % |
+| 55,000 | two processes, hashed | 45–47 % |
+| 55,000 | steered (one process serves) | 40 % |
+| 80,000 | two processes, hashed | 53–55 % |
+| 80,000 | three processes, hashed | 68 % |
+| 120,000 | two processes, hashed | fail: fd budget full, 19k reconnects, p95 575 ms |
+| 120,000 | steered | 68 %, pass |
 
 ## Tried and rejected (measured, not guessed)
 
 | Idea | Result |
 |---|---|
 | One process | Capped near 59k sockets by `LimitNOFILE`; beyond that every request reconnects |
+| Two or three processes with plain `SO_REUSEPORT` hashing | Every process serves traffic: +8–14 points CPU, and two run out of fds before 120k |
+| Starting the next process only when one fills | The filling process has no fds left to fork with (`pipe2: too many open files`) |
+| Switching to the next process on the housekeeping tick | A burst pushed a process hundreds of sockets past its mark; now checked on every accept |
 | Group commit holding the write lock from the first write to the end of the loop pass | p99 ~470 ms: the other process waited for the whole pass |
 | `PASSIVE` checkpoints | WAL never rewound, 800 MB after a minute |
 | `locking_mode=EXCLUSIVE` (one process, checkpoint in the loop) | -3 points CPU, but every fsync landed in the event loop and p99 rose |

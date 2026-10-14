@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"syscall"
 	"time"
@@ -20,6 +21,9 @@ const (
 	maxEvents   = 1024
 	readBufSize = 64 << 10
 	fdHeadroom  = 6000
+	// maxConnTable bounds the per-process connection table when the fd limit is far above the
+	// 65535 the benchmark service gets.
+	maxConnTable = 1 << 18
 
 	// The frozen syscall package defines SO_REUSEPORT for linux/arm64 but not linux/amd64.
 	soReusePort = 0xf
@@ -44,6 +48,9 @@ type server struct {
 	conns     []conn
 	open      int
 	high      int
+	fillAt    int // past this many sockets the worker asks for the next one to take new connections
+	ctrl      *controller
+	rep       *reporter
 	sweepPos  int
 	events    []syscall.EpollEvent
 	ctl       syscall.EpollEvent
@@ -60,7 +67,7 @@ func newServer(host string, port int, app *app) (*server, error) {
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
 		return nil, err
 	}
-	nofile := int(lim.Cur)
+	nofile := min(int(lim.Cur), maxConnTable)
 	lfd, err := listen(host, port)
 	if err != nil {
 		return nil, err
@@ -70,19 +77,21 @@ func newServer(host string, port int, app *app) (*server, error) {
 		return nil, err
 	}
 	s := &server{
-		epfd:   epfd,
-		lfd:    lfd,
-		conns:  make([]conn, nofile),
-		high:   max(nofile*3/4, nofile-fdHeadroom),
+		epfd:  epfd,
+		lfd:   lfd,
+		conns: make([]conn, nofile),
+		high:  max(nofile*3/4, nofile-fdHeadroom),
+
 		events: make([]syscall.EpollEvent, maxEvents),
 		rbuf:   make([]byte, readBufSize),
 		wbuf:   make([]byte, 0, 256<<10),
 		date:   make([]byte, 0, 64),
 		app:    app,
 	}
+	s.fillAt = s.high - s.high/20
 	s.resumeListener()
 	s.clock()
-	log.Printf("listening on %s:%d, fd limit %d, idle reaping above %d connections", host, port, nofile, s.high)
+	log.Printf("pid %d listening on %s:%d, fd limit %d, fills to %d connections", os.Getpid(), host, port, nofile, s.fillAt)
 	return s, nil
 }
 
@@ -140,9 +149,12 @@ func (s *server) run() {
 		s.clock()
 		for i := 0; i < n; i++ {
 			ev := &s.events[i]
-			if int(ev.Fd) == s.lfd {
+			switch fd := int(ev.Fd); {
+			case fd == s.lfd:
 				s.acceptAll()
-			} else {
+			case s.ctrl != nil && s.ctrl.owns(fd):
+				s.ctrl.handle(fd)
+			default:
 				s.handle(int(ev.Fd), ev.Events)
 			}
 		}
@@ -152,6 +164,9 @@ func (s *server) run() {
 			s.reap(s.open-s.high, idleReapMs)
 			if !s.listening && s.open < s.high {
 				s.resumeListener()
+			}
+			if s.ctrl != nil {
+				s.ctrl.tick()
 			}
 			nextTick = s.nowMs + tickMs
 		}
@@ -203,6 +218,21 @@ func (s *server) acceptAll() {
 		}
 		s.conns[fd] = conn{lastMs: s.nowMs, open: true}
 		s.open++
+		if s.open == s.fillAt {
+			s.filled()
+		}
+	}
+}
+
+// filled hands new connections to the next worker the moment this one reaches its fill mark;
+// waiting for the housekeeping tick let a burst push a worker hundreds of sockets past it.
+func (s *server) filled() {
+	switch {
+	case s.ctrl != nil && s.ctrl.active == 0:
+		s.ctrl.advance()
+	case s.rep != nil && !s.rep.full:
+		s.rep.full = true
+		s.rep.send(msgFull)
 	}
 }
 
@@ -218,6 +248,15 @@ func (s *server) resumeListener() {
 	if err := syscall.EpollCtl(s.epfd, syscall.EPOLL_CTL_ADD, s.lfd, &s.ctl); err == nil {
 		s.listening = true
 	}
+}
+
+func (s *server) watch(fd int) {
+	s.ctl = syscall.EpollEvent{Events: syscall.EPOLLIN, Fd: int32(fd)}
+	syscall.EpollCtl(s.epfd, syscall.EPOLL_CTL_ADD, fd, &s.ctl)
+}
+
+func (s *server) unwatch(fd int) {
+	syscall.EpollCtl(s.epfd, syscall.EPOLL_CTL_DEL, fd, nil)
 }
 
 func (s *server) setInterest(fd int, events uint32) {
